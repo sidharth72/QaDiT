@@ -1,0 +1,18 @@
+# Core (needed for train.py --smoke: torch only)
+torch>=2.2
+
+# Audio front-end (precompute + inference)
+torchaudio>=2.2
+soundfile>=0.12
+
+# Frozen pretrained components (precompute + inference only, never training)
+transformers>=4.40      # FLAN-T5, AST, SpeechT5HifiGan vocoder
+diffusers>=0.27         # AudioLDM AutoencoderKL (VAE only - the DiT is ours)
+accelerate>=0.30        # speeds up HF model loading
+
+# Dataset
+# Pinned below 4.0: datasets 4.x switched audio decoding to torchcodec, which
+# needs FFmpeg installed separately.  precompute.py handles both formats, but
+# 3.x "just works" everywhere.  If you use >=4.0, also install torchcodec+FFmpeg.
+datasets>=3.0,<4.0
+numpy>=1.24
