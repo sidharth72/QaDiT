@@ -419,7 +419,7 @@ def main():
     # Fork one process per TPU chip (8 on v5e-8).  `torch_xla.launch` is the
     # modern entry point; xmp.spawn is the fallback for older torch_xla.
 
-    xmp.spawn(_mp_fn, args=(args,), nprocs=8, start_method="fork")
+    xmp.spawn(_mp_fn, args=(args,), nprocs=None, start_method="fork")
 
 
 if __name__ == "__main__":
