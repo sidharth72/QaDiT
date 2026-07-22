@@ -1,10 +1,14 @@
 """
 PyTorch/XLA training loop for Kaggle TPU v5e-8 (8 chips, data parallel).
 
-Run it directly on a Kaggle TPU VM session:
+Run it directly on a Kaggle TPU VM session (from a notebook cell, as a SCRIPT):
 
-    python train_xla.py --data /kaggle/input/audiocaps-precomputed \
-                        --out  /kaggle/working/runs/dit_b2
+    !python train_xla.py --data /kaggle/input/.../audiocaps-precomputed-cache \
+                         --out  /kaggle/working/runs/dit_b2
+
+Do NOT call torch_xla.launch from a notebook cell, and do NOT touch
+xm.xla_device() in the notebook before launching. Kaggle sets
+TPU_PROCESS_ADDRESSES which this file clears automatically.
 
 What is different from the GPU/CPU loop in train.py, and WHY
 ------------------------------------------------------------
@@ -53,6 +57,21 @@ import wandb
 import shutil
 import os
 
+# Kaggle injects TPU_PROCESS_ADDRESSES="local" (1 address). Multi-process XLA
+# needs one address per chip (8 on v5e-8). If left set, init fails with:
+#   Expected 8 worker addresses, got 1
+# Pop it BEFORE importing/initializing torch_xla. See:
+#   https://www.kaggle.com/discussions/product-feedback/473974
+for _kaggle_tpu_env in (
+    "TPU_PROCESS_ADDRESSES",
+    "TPU_WORKER_HOSTNAMES",
+    "TPU_WORKER_ID",
+    "CLOUD_TPU_TASK_ID",
+):
+    os.environ.pop(_kaggle_tpu_env, None)
+
+os.environ.setdefault("PJRT_DEVICE", "TPU")
+
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, DistributedSampler
@@ -61,13 +80,13 @@ import torch_xla
 import torch_xla.core.xla_model as xm
 import torch_xla.distributed.parallel_loader as pl
 import torch_xla.runtime as xr
+import torch_xla.distributed.xla_multiprocessing as xmp
 
 from config import Config
 from dataset import PrecomputedAudioCaps
 from diffusion import Diffusion
 from dit import RepaProjector, repa_loss
 from train import EMA, build_model, lr_lambda_factory, repa_lambda
-import torch_xla.distributed.xla_multiprocessing as xmp
 
 
 def collate_tensors_only(batch: list[dict]) -> dict:
@@ -413,13 +432,27 @@ def main():
     ap.add_argument("--path_in_repo", type=str, default="checkpoints")
     ap.add_argument("--wandb_project", type=str, default="audio-dit")
     ap.add_argument("--wandb_run_name", type=str, default=None)
-    ap.add_argument("--wandb_enabled", type=bool, default=True)
+    ap.add_argument("--wandb_enabled", action=argparse.BooleanOptionalAction,
+                    default=True,
+                    help="Use --wandb-enabled / --no-wandb-enabled")
     args = ap.parse_args()
 
-    # Fork one process per TPU chip (8 on v5e-8).  `torch_xla.launch` is the
-    # modern entry point; xmp.spawn is the fallback for older torch_xla.
+    # Safety: clear again in case the parent notebook re-exported these.
+    for key in (
+        "TPU_PROCESS_ADDRESSES",
+        "TPU_WORKER_HOSTNAMES",
+        "TPU_WORKER_ID",
+        "CLOUD_TPU_TASK_ID",
+    ):
+        os.environ.pop(key, None)
+    os.environ.setdefault("PJRT_DEVICE", "TPU")
 
-    xmp.spawn(_mp_fn, args=(args,), nprocs=None, start_method="fork")
+    # One process per TPU chip. Prefer torch_xla.launch; fall back to xmp.spawn.
+    # Use the default start_method (spawn). Do NOT pass nprocs=1.
+    try:
+        torch_xla.launch(_mp_fn, args=(args,))
+    except AttributeError:
+        xmp.spawn(_mp_fn, args=(args,), nprocs=None)
 
 
 if __name__ == "__main__":
