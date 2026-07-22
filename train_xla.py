@@ -67,6 +67,7 @@ from dataset import PrecomputedAudioCaps
 from diffusion import Diffusion
 from dit import RepaProjector, repa_loss
 from train import EMA, build_model, lr_lambda_factory, repa_lambda
+import torch_xla.distributed.xla_multiprocessing as xmp
 
 
 def collate_tensors_only(batch: list[dict]) -> dict:
@@ -417,11 +418,8 @@ def main():
 
     # Fork one process per TPU chip (8 on v5e-8).  `torch_xla.launch` is the
     # modern entry point; xmp.spawn is the fallback for older torch_xla.
-    try:
-        torch_xla.launch(_mp_fn, args=(args,))
-    except AttributeError:
-        import torch_xla.distributed.xla_multiprocessing as xmp
-        xmp.spawn(_mp_fn, args=(args,))
+
+    xmp.spawn(_mp_fn, args=(args,), nprocs=8, start_method="fork")
 
 
 if __name__ == "__main__":
