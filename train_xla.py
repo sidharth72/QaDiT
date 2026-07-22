@@ -60,15 +60,23 @@ import os
 # Kaggle injects TPU_PROCESS_ADDRESSES="local" (1 address). Multi-process XLA
 # needs one address per chip (8 on v5e-8). If left set, init fails with:
 #   Expected 8 worker addresses, got 1
-# Pop it BEFORE importing/initializing torch_xla. See:
-#   https://www.kaggle.com/discussions/product-feedback/473974
-for _kaggle_tpu_env in (
-    "TPU_PROCESS_ADDRESSES",
-    "TPU_WORKER_HOSTNAMES",
-    "TPU_WORKER_ID",
-    "CLOUD_TPU_TASK_ID",
+# Only pop THIS variable (see Kaggle product-feedback/473974). Do not strip
+# other TPU_* vars — that can break rank discovery (int(None) on LOCAL_RANK).
+os.environ.pop("TPU_PROCESS_ADDRESSES", None)
+
+# Notebook / accelerate leftovers make torch_xla.launch() think a distributed
+# job is already running, then it does int(os.environ["LOCAL_RANK"]) → None.
+for _dist_env in (
+    "WORLD_SIZE",
+    "LOCAL_WORLD_SIZE",
+    "RANK",
+    "LOCAL_RANK",
+    "GROUP_RANK",
+    "ROLE_RANK",
+    "ROLE_NAME",
+    "TORCHELASTIC_RUN_ID",
 ):
-    os.environ.pop(_kaggle_tpu_env, None)
+    os.environ.pop(_dist_env, None)
 
 os.environ.setdefault("PJRT_DEVICE", "TPU")
 
@@ -437,22 +445,25 @@ def main():
                     help="Use --wandb-enabled / --no-wandb-enabled")
     args = ap.parse_args()
 
-    # Safety: clear again in case the parent notebook re-exported these.
+    # Re-clear in case the parent notebook exported these into the shell env.
+    os.environ.pop("TPU_PROCESS_ADDRESSES", None)
     for key in (
-        "TPU_PROCESS_ADDRESSES",
-        "TPU_WORKER_HOSTNAMES",
-        "TPU_WORKER_ID",
-        "CLOUD_TPU_TASK_ID",
+        "WORLD_SIZE",
+        "LOCAL_WORLD_SIZE",
+        "RANK",
+        "LOCAL_RANK",
+        "GROUP_RANK",
+        "ROLE_RANK",
+        "ROLE_NAME",
+        "TORCHELASTIC_RUN_ID",
     ):
         os.environ.pop(key, None)
     os.environ.setdefault("PJRT_DEVICE", "TPU")
 
-    # One process per TPU chip. Prefer torch_xla.launch; fall back to xmp.spawn.
-    # Use the default start_method (spawn). Do NOT pass nprocs=1.
-    try:
-        torch_xla.launch(_mp_fn, args=(args,))
-    except AttributeError:
-        xmp.spawn(_mp_fn, args=(args,), nprocs=None)
+    # Use xmp.spawn directly on Kaggle. torch_xla.launch() can take a
+    # "already distributed" branch when WORLD_SIZE/LOCAL_RANK are present and
+    # then crash with: int() argument ... not 'NoneType'.
+    xmp.spawn(_mp_fn, args=(args,), nprocs=None)
 
 
 if __name__ == "__main__":
