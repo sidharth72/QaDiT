@@ -196,6 +196,7 @@ def main():
                               "repa": [], "caption": []}
     shard_idx, in_shard = 0, 0
     shard_files: list[str] = []
+    shard_sizes: list[int] = []
 
     def flush_shard():
         nonlocal shard, shard_idx, in_shard
@@ -211,6 +212,7 @@ def main():
         }, path)
         print(f"[precompute] wrote {path.name}  ({in_shard} samples)")
         shard_files.append(path.name)
+        shard_sizes.append(in_shard)
         shard = {k: [] for k in shard}
         shard_idx += 1
         in_shard = 0
@@ -275,6 +277,10 @@ def main():
         "split": args.split,
         "num_samples": n_total,
         "shards": shard_files,
+        # Lets dataset.py build its random-access index without loading every
+        # (potentially hundreds-of-MB) shard merely to inspect its first axis.
+        "shard_size": args.shard_size,
+        "shard_sizes": shard_sizes,
         # Multiply latents by this to get ~unit variance (divide back before
         # VAE decode).  This is the Stable-Diffusion-0.18215 analog, estimated
         # from this dataset instead of hard-coded.

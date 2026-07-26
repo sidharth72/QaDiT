@@ -27,7 +27,11 @@ pretrained components (AudioLDM VAE, FLAN-T5, AST, HiFi-GAN vocoder).
 pip install -r requirements.txt
 ```
 
-(For the smoke test alone, `torch` is enough.)
+(For the smoke test alone, `torch` is enough. On TPU, do not install an
+arbitrary `torch_xla` version: `torch` and `torch_xla` must have matching
+major/minor versions. Kaggle normally supplies the pair; if its image is
+inconsistent, install an official matched pair such as
+`torch==2.9.0` and `torch_xla[tpu]==2.9.0` before importing either package.)
 
 ## 1. Smoke test (no data, no downloads, CPU-friendly)
 
@@ -78,18 +82,33 @@ result — it is the quality ceiling of everything downstream
 ## 5. Train on Kaggle TPU v5e-8 (PyTorch/XLA)
 
 Upload the `.py` files as one Kaggle Dataset and the precompute cache as
-another, open `train.ipynb` with the TPU v5e-8 accelerator, and run it — it
-stages the code and launches:
+another. The cache must contain both `train/` and `validation/`. Open
+`train.ipynb` with the TPU v5e-8 accelerator; it stages the source and launches
+the trainer as a fresh process (the notebook kernel never initializes XLA):
 
 ```bash
 python train_xla.py --data /kaggle/input/audiocaps-precomputed \
-    --out /kaggle/working/runs/dit_b2
+    --out /kaggle/working/runs/dit_b2 \
+    --batch-size 4 --grad-accum-steps 8 \
+    --val-every 2000 --val-batch-size 4
 ```
 
 `train_xla.py` is the XLA port of `train.py` (same model/math, different
-harness): one process per chip via `torch_xla.launch`, `DistributedSampler`
-over the shards, `MpDeviceLoader` prefetching, all-reduce → global grad clip →
-step, bf16 autocast, logging through `xm.add_step_closure` (no host syncs in
-the hot path), and master-only `xm.save` checkpoints. Per-chip batch is
-`cfg.train.batch_size` (32) → **global batch 256**. Kaggle sessions preempt:
-checkpoints are written every `ckpt_every` steps, resume with `--resume`.
+harness): one process per chip via `xmp.spawn`, shard-local distributed
+sampling, `MpDeviceLoader` prefetching, bf16 autocast, gradient accumulation,
+all-reduce → global grad clip → step, and XLA-safe logging. The defaults use a
+microbatch of 4 per chip and 8 accumulation passes, preserving an **effective
+global batch of 4 × 8 × 8 = 256** while fitting v5e's 16 GB/chip HBM.
+
+Every `--val-every` optimizer updates, validation covers the split exactly once
+across all chips (no DistributedSampler padding), disables CFG dropout, and
+logs globally sample-weighted raw/EMA diffusion losses plus REPA loss. Validation
+latents deliberately use the training split's scale; held-out statistics do not
+alter the model's input transform.
+
+Checkpoints are written atomically every `ckpt_every` optimizer updates and
+include model/projector/EMA, optimizer/scheduler, exact data cursor, per-rank
+XLA RNG state, best validation state, and W&B run ID. Resume with
+`--resume /path/to/ckpt_XXXXXXX.pt`; the batch/accumulation/world-size settings
+must match. Legacy checkpoints still load, but their old sampler position can
+only be approximated.
