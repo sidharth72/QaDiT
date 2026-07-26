@@ -448,6 +448,10 @@ def _mp_fn(index: int, args: argparse.Namespace):
         )
 
     # ---------------- data (sharded across the 8 chips) -------------------- #
+    # Train and validation are SEPARATE precomputed folders under --data:
+    #   <data>/train/       <- used for gradient updates (all train samples)
+    #   <data>/validation/  <- held-out eval only; does NOT reduce train size
+    # We only reuse train's latent_scale so held-out stats never redefine inputs.
     ds = PrecomputedAudioCaps(args.data, "train")
     sampler = ShardDistributedSampler(
         ds, num_replicas=world, rank=rank,
@@ -466,6 +470,9 @@ def _mp_fn(index: int, args: argparse.Namespace):
 
     val_ds = PrecomputedAudioCaps(
         args.data, args.val_split, latent_scale=ds.latent_scale)
+    if len(val_ds) == 0:
+        raise ValueError(
+            f"validation split '{args.val_split}' is empty under {args.data}")
     val_sampler = DistributedEvalSampler(
         val_ds, num_replicas=world, rank=rank)
     val_loader = DataLoader(
