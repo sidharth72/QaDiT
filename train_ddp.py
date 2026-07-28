@@ -105,8 +105,13 @@ def init_wandb(
     run_name: str | None = None,
     enabled: bool = True,
     resume_id: str | None = None,
+    api_key: str | None = None,
 ):
-    """Create one W&B run on global rank zero."""
+    """Create one W&B run on global rank zero.
+
+    Authenticates with the API key immediately so wandb never prompts for a
+    browser/API-key choice in notebooks or headless jobs.
+    """
     if not (enabled and is_master):
         return None
     if wandb is None:
@@ -114,12 +119,23 @@ def init_wandb(
             "wandb is not installed; install requirements.txt or pass "
             "--no-wandb-enabled"
         )
+    key = api_key or os.environ.get("WANDB_API_KEY")
+    if not key:
+        raise RuntimeError(
+            "W&B is enabled but no API key was found. Pass --wandb-api-key, "
+            "set WANDB_API_KEY, or use --no-wandb-enabled"
+        )
+    os.environ["WANDB_API_KEY"] = key
+    # Keep the session non-interactive even if wandb tries to re-auth.
+    os.environ.setdefault("WANDB_SILENT", "true")
+    wandb.login(key=key, relogin=True, anonymous="never")
     run = wandb.init(
         project=project,
         name=run_name or "dit_b2_2xt4",
         config=cfg.as_dict(),
         resume="allow" if resume_id else None,
         id=resume_id,
+        settings=wandb.Settings(quiet=True),
     )
     print(f"[wandb] run: {run.url}", flush=True)
     return run
@@ -653,6 +669,7 @@ def train(args: argparse.Namespace):
         run_name=args.wandb_run_name,
         enabled=args.wandb_enabled,
         resume_id=wandb_resume_id,
+        api_key=args.wandb_api_key,
     )
     if wandb_run is not None:
         wandb_run.config.update(
@@ -1004,6 +1021,13 @@ def parse_args() -> argparse.Namespace:
         "--wandb_run_name",
         dest="wandb_run_name",
         default=None,
+    )
+    ap.add_argument(
+        "--wandb-api-key",
+        "--wandb_api_key",
+        dest="wandb_api_key",
+        default=os.environ.get("WANDB_API_KEY"),
+        help="W&B API key; defaults to WANDB_API_KEY env (no interactive login)",
     )
     ap.add_argument(
         "--wandb-enabled",
