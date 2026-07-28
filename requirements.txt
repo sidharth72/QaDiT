@@ -17,7 +17,6 @@ accelerate>=0.30        # speeds up HF model loading
 datasets>=3.0,<4.0
 numpy>=1.24
 
-# TPU training telemetry/checkpoint backup (torch + torch_xla must be installed
-# as a matched pair by the Kaggle TPU image; see README.md).
+# DDP training telemetry and checkpoint backup.
 huggingface_hub
 wandb

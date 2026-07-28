@@ -16,9 +16,8 @@ pretrained components (AudioLDM VAE, FLAN-T5, AST, HiFi-GAN vocoder).
 | `diffusion.py` | Cosine schedule, forward noising, v-prediction targets, logit-normal `t` sampling, DDIM sampler with CFG |
 | `precompute.py` | AudioCaps → cached VAE latents, T5 embeddings + masks, AST REPA targets (sharded `.pt` files + `meta.json`) |
 | `dataset.py` | `Dataset`/collate over the precomputed shards (returns latents pre-scaled to unit variance) |
-| `train.py` | Training loop (GPU/CPU): CFG dropout, REPA loss with decaying weight, EMA, warmup+cosine LR, checkpointing, `--smoke` mode |
-| `train_xla.py` | The same training on TPU via PyTorch/XLA: 8-way data parallel, `MpDeviceLoader`, bf16 autocast, sync-free logging, `xm.save` checkpoints |
-| `train.ipynb` | Kaggle launcher notebook for `train_xla.py` on a TPU v5e-8 |
+| `train.py` | Single-process GPU/CPU loop with a CPU-friendly `--smoke` mode |
+| `train_ddp.py` | Production trainer for Kaggle 2 x T4: NCCL DDP, FP16 AMP, gradient accumulation, distributed validation and exact resume |
 | `sample.py` | Inference: caption → T5 → DDIM+CFG → VAE decode → HiFi-GAN → `.wav` |
 
 ## Install
@@ -27,11 +26,8 @@ pretrained components (AudioLDM VAE, FLAN-T5, AST, HiFi-GAN vocoder).
 pip install -r requirements.txt
 ```
 
-(For the smoke test alone, `torch` is enough. On TPU, do not install an
-arbitrary `torch_xla` version: `torch` and `torch_xla` must have matching
-major/minor versions. Kaggle normally supplies the pair; if its image is
-inconsistent, install an official matched pair such as
-`torch==2.9.0` and `torch_xla[tpu]==2.9.0` before importing either package.)
+For the smoke test alone, `torch` is enough. Kaggle GPU images already include
+a CUDA-enabled PyTorch build; do not replace it with a CPU-only wheel.
 
 ## 1. Smoke test (no data, no downloads, CPU-friendly)
 
@@ -79,36 +75,42 @@ clips (`wav → mel → VAE encode → decode → vocoder → wav`) and *listen*
 result — it is the quality ceiling of everything downstream
 (see `AudioDiffusionModel.md` §6).
 
-## 5. Train on Kaggle TPU v5e-8 (PyTorch/XLA)
+## 5. Train on Kaggle 2 x T4 (PyTorch DDP + mixed precision)
 
-Upload the `.py` files as one Kaggle Dataset and the precompute cache as
-another. The cache must contain both `train/` and `validation/`. Open
-`train.ipynb` with the TPU v5e-8 accelerator; it stages the source and launches
-the trainer as a fresh process (the notebook kernel never initializes XLA):
+Upload the source files and precomputed cache as Kaggle Datasets, select the
+**GPU T4 x2** accelerator, copy the source to a writable working directory,
+and launch one process per GPU with `torchrun`. The cache must contain both
+`train/` and `validation/`:
 
 ```bash
-python train_xla.py --data /kaggle/input/audiocaps-precomputed \
+torchrun --standalone --nproc_per_node=2 train_ddp.py \
+    --data /kaggle/input/audiocaps-precomputed \
     --out /kaggle/working/runs/dit_b2 \
-    --batch-size 4 --grad-accum-steps 8 \
-    --val-every 2000 --val-batch-size 4
+    --batch-size 2 --grad-accum-steps 64 \
+    --val-every 2000 --val-batch-size 2
 ```
 
-`train_xla.py` is the XLA port of `train.py` (same model/math, different
-harness): one process per chip via `xmp.spawn`, shard-local distributed
-sampling, `MpDeviceLoader` prefetching, bf16 autocast, gradient accumulation,
-all-reduce → global grad clip → step, and XLA-safe logging. The defaults use a
-microbatch of 4 per chip and 8 accumulation passes, preserving an **effective
-global batch of 4 × 8 × 8 = 256** while fitting v5e's 16 GB/chip HBM.
+`train_ddp.py` keeps the model and diffusion math unchanged. `torchrun` assigns
+one process to each T4, NCCL DDP averages gradients, and CUDA autocast +
+`GradScaler` use FP16 safely. The defaults use a microbatch of 2 per GPU and 64
+accumulation passes, preserving an **effective global batch of 2 × 64 × 2 =
+256** while fitting each T4's 16 GB VRAM. If memory allows, increase
+`--batch-size` and reduce `--grad-accum-steps` by the same factor. If a run is
+unstable, `--no-amp` is available for diagnosis but uses substantially more
+memory.
 
 Every `--val-every` optimizer updates, validation covers the split exactly once
-across all chips (no DistributedSampler padding), disables CFG dropout, and
+across both GPUs (no DistributedSampler padding), disables CFG dropout, and
 logs globally sample-weighted raw/EMA diffusion losses plus REPA loss. Validation
 latents deliberately use the training split's scale; held-out statistics do not
 alter the model's input transform.
 
 Checkpoints are written atomically every `ckpt_every` optimizer updates and
 include model/projector/EMA, optimizer/scheduler, exact data cursor, per-rank
-XLA RNG state, best validation state, and W&B run ID. Resume with
+CPU/CUDA RNG state, AMP scaler, best validation state, and W&B run ID. Resume
+with
 `--resume /path/to/ckpt_XXXXXXX.pt`; the batch/accumulation/world-size settings
-must match. Legacy checkpoints still load, but their old sampler position can
-only be approximated.
+and FP16 mode must match. The trainer also validates both cache metadata files
+and sampler geometry before restoring an exact data cursor. Legacy checkpoints
+still load, but their old sampler position or cache identity can only be
+approximated.

@@ -2,9 +2,9 @@
 Dataset over the shards written by precompute.py.
 
 Each shard is a single .pt file holding a few hundred samples as stacked
-tensors, so reads are large and sequential (friendly to spinning disks, cloud
-buckets and, later, to a grain/tf.data port on TPU).  Shards are cached in
-memory with a tiny LRU so random access across shard boundaries stays cheap.
+tensors, so reads are large and sequential (friendly to spinning disks and
+cloud buckets). Shards are cached in memory with a tiny LRU so random access
+across shard boundaries stays cheap.
 """
 
 from bisect import bisect_right
@@ -58,7 +58,7 @@ class PrecomputedAudioCaps(Dataset):
             # Old caches did not record per-shard sizes. precompute.py always
             # wrote full shards followed by one remainder, so num_samples and
             # the number of shard files are enough to recover them without
-            # reading the entire cache once per XLA rank.
+            # reading the entire cache once per distributed rank.
             total = int(self.meta["num_samples"])
             n_shards = len(self.shard_files)
             if n_shards == 0:

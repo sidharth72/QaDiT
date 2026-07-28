@@ -44,9 +44,8 @@ class Diffusion:
     def to(self, device) -> "Diffusion":
         """Move the schedule table to the accelerator ONCE.
 
-        On XLA, leaving alpha_bar on CPU would re-upload it (host->device
-        transfer) inside every training step; pinning it on the device keeps
-        the step graph free of host traffic.
+        Keeping alpha_bar on the accelerator avoids a host-to-device transfer
+        inside every training step.
         """
         self.alpha_bar = self.alpha_bar.to(device)
         return self
