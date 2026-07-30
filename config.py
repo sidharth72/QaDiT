@@ -112,15 +112,15 @@ class TrainConfig:
     batch_size: int = 32
     lr: float = 1e-4
     weight_decay: float = 0.0
-    warmup_steps: int = 1000
-    total_steps: int = 200_000
+    warmup_steps: int = 500
+    total_steps: int = 20_000
     ema_decay: float = 0.9999
     grad_clip: float = 1.0
     # REPA loss weight: starts at repa_weight, linearly decays to 0 over
     # repa_decay_steps (REPA helps most early; let the diffusion loss own the
     # end of training).  Set repa_weight=0.0 to disable REPA entirely (A/B).
     repa_weight: float = 0.5
-    repa_decay_steps: int = 200_000
+    repa_decay_steps: int = 15_000
     log_every: int = 50
     ckpt_every: int = 2000
     seed: int = 0
