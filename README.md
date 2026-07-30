@@ -17,7 +17,7 @@ pretrained components (AudioLDM VAE, FLAN-T5, AST, HiFi-GAN vocoder).
 | `precompute.py` | AudioCaps → cached VAE latents, T5 embeddings + masks, AST REPA targets (sharded `.pt` files + `meta.json`) |
 | `dataset.py` | `Dataset`/collate over the precomputed shards (returns latents pre-scaled to unit variance) |
 | `train.py` | Single-process GPU/CPU loop with a CPU-friendly `--smoke` mode |
-| `train_ddp.py` | Production trainer for Kaggle 2 x T4: NCCL DDP, FP16 AMP, gradient accumulation, distributed validation and exact resume |
+| `train_ddp.py` | Production trainer (2 x RTX 5090 or 2 x T4): NCCL DDP, FP16 AMP, gradient accumulation, distributed validation, exact resume, wall-clock budget and HF checkpoint mirroring |
 | `sample.py` | Inference: caption → T5 → DDIM+CFG → VAE decode → HiFi-GAN → `.wav` |
 
 ## Install
@@ -75,42 +75,87 @@ clips (`wav → mel → VAE encode → decode → vocoder → wav`) and *listen*
 result — it is the quality ceiling of everything downstream
 (see `AudioDiffusionModel.md` §6).
 
-## 5. Train on Kaggle 2 x T4 (PyTorch DDP + mixed precision)
+## 5. Train with two GPUs (PyTorch DDP + mixed precision)
 
-Upload the source files and precomputed cache as Kaggle Datasets, select the
-**GPU T4 x2** accelerator, copy the source to a writable working directory,
-and launch one process per GPU with `torchrun`. The cache must contain both
-`train/` and `validation/`:
+`train_ddp.py` keeps the model and diffusion math identical to `train.py` and
+changes only the execution harness. `torchrun` runs one process per GPU, NCCL
+DDP averages gradients, and CUDA autocast + `GradScaler` provide FP16.
+
+### 5.1 Prove the harness first (30 seconds, no data needed)
+
+Always run this on a fresh machine before starting a paid job. It builds a
+synthetic cache, trains a tiny model, validates, checkpoints, resumes and (if
+you pass HF/W&B credentials) exercises those too:
+
+```bash
+torchrun --standalone --nproc_per_node=2 train_ddp.py --smoke
+```
+
+A clean `[ddp] finished all 20 steps` means NCCL, DDP, AMP, the samplers,
+validation and checkpointing are all working on this machine.
+
+### 5.2 RunPod, 2 x RTX 5090
+
+Blackwell needs a CUDA 12.8+ PyTorch build (**torch >= 2.8**); the trainer
+checks the installed build has `sm_120` kernels and exits immediately if not,
+rather than failing deep into a paid run.
+
+```bash
+torchrun --standalone --nproc_per_node=2 train_ddp.py \
+    --data /workspace/cache \
+    --out /workspace/runs/dit_b2 \
+    --batch-size 8 --grad-accum-steps 16 \
+    --max-hours 7.5 --resume auto \
+    --hf-repo-id you/audio-dit-checkpoints --hf-token "$HF_TOKEN" \
+    --wandb-api-key "$WANDB_API_KEY"
+```
+
+A 32 GB 5090 fits a much larger microbatch than a T4. Keep
+`batch_size × grad_accum_steps × num_gpus` at **256** so the effective global
+batch (and therefore the LR schedule) is unchanged: `8 × 16 × 2 = 256`.
+
+### 5.3 Kaggle, 2 x T4
+
+Same script; the 16 GB cards need the smaller microbatch. If NCCL hangs at
+startup on Kaggle, export `NCCL_P2P_DISABLE=1` first.
 
 ```bash
 torchrun --standalone --nproc_per_node=2 train_ddp.py \
     --data /kaggle/input/audiocaps-precomputed \
     --out /kaggle/working/runs/dit_b2 \
-    --batch-size 2 --grad-accum-steps 64 \
-    --val-every 2000 --val-batch-size 2
+    --batch-size 2 --grad-accum-steps 64
 ```
 
-`train_ddp.py` keeps the model and diffusion math unchanged. `torchrun` assigns
-one process to each T4, NCCL DDP averages gradients, and CUDA autocast +
-`GradScaler` use FP16 safely. The defaults use a microbatch of 2 per GPU and 64
-accumulation passes, preserving an **effective global batch of 2 × 64 × 2 =
-256** while fitting each T4's 16 GB VRAM. If memory allows, increase
-`--batch-size` and reduce `--grad-accum-steps` by the same factor. If a run is
-unstable, `--no-amp` is available for diagnosis but uses substantially more
-memory.
+### 5.4 Unattended-run behaviour
 
-Every `--val-every` optimizer updates, validation covers the split exactly once
-across both GPUs (no DistributedSampler padding), disables CFG dropout, and
-logs globally sample-weighted raw/EMA diffusion losses plus REPA loss. Validation
-latents deliberately use the training split's scale; held-out statistics do not
-alter the model's input transform.
+`--max-hours` stops cleanly at a wall-clock budget and `SIGTERM`/`SIGINT` (pod
+eviction, Ctrl-C) does the same: the run finishes the current optimizer step,
+writes a checkpoint, force-uploads it, and exits 0. All ranks agree on the stop
+via a collective, so no rank is ever left waiting.
+
+`--resume auto` continues from the newest checkpoint in `--out`, downloading it
+back from the Hugging Face repo first if local storage was wiped. Restarting a
+recycled pod is therefore the same command as the original launch.
 
 Checkpoints are written atomically every `ckpt_every` optimizer updates and
-include model/projector/EMA, optimizer/scheduler, exact data cursor, per-rank
-CPU/CUDA RNG state, AMP scaler, best validation state, and W&B run ID. Resume
-with
-`--resume /path/to/ckpt_XXXXXXX.pt`; the batch/accumulation/world-size settings
-and FP16 mode must match. The trainer also validates both cache metadata files
-and sampler geometry before restoring an exact data cursor. Legacy checkpoints
-still load, but their old sampler position or cache identity can only be
-approximated.
+carry model/projector/EMA, optimizer/scheduler, AMP scaler, exact data cursor,
+per-rank CPU/CUDA RNG state, best validation state and the W&B run ID. Resume
+refuses to proceed if the config, batch size, accumulation, world size, FP16
+mode or dataset signature differ from the checkpoint, so a resumed run is never
+silently a different experiment.
+
+Each upload replaces older `ckpt_*.pt` files in the repo in the same commit, so
+remote storage stays flat instead of growing ~2.6 GB per save. `--keep-local`
+bounds local copies and never deletes the last one unless an upload succeeded.
+(HF keeps deleted blobs in git history; squash or recreate the repo if the
+accumulated history becomes a quota problem.)
+
+Every `--val-every` optimizer updates, validation covers the split exactly once
+across both GPUs (no DistributedSampler padding), disables CFG dropout, and logs
+globally sample-weighted raw/EMA diffusion losses plus REPA loss. Validation
+latents deliberately use the training split's scale, so held-out statistics
+never alter the model's input transform.
+
+`--total-steps`, `--ckpt-every`, `--log-every`, `--warmup-steps` and
+`--repa-decay-steps` override `config.py` from the command line. They are part
+of the config signature, so use identical values when resuming.

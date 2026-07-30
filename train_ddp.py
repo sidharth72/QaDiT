@@ -1,25 +1,41 @@
 """
-Two-GPU PyTorch DDP trainer for the text-to-audio latent DiT.
+Multi-GPU PyTorch DDP trainer for the text-to-audio latent DiT.
 
-Designed for Kaggle's 2 x NVIDIA T4 accelerator. Launch it as a script:
+Verified on 2 x RTX 5090 (RunPod) and 2 x T4 (Kaggle). Launch as a script:
 
     torchrun --standalone --nproc_per_node=2 train_ddp.py \
-        --data /kaggle/input/audiocaps-precomputed \
-        --out /kaggle/working/runs/dit_b2
+        --data /workspace/cache --out /workspace/runs/dit_b2
 
-Each torchrun process owns one GPU. DDP averages gradients across the two
-replicas, FP16 autocast and GradScaler reduce memory use, and gradient
-accumulation preserves a large effective global batch.
+Blackwell (RTX 5090, sm_120) requires a PyTorch build compiled for it,
+which in practice means torch >= 2.8. The trainer checks this at startup
+and fails immediately rather than deep into the run.
+
+Unattended-run features, all designed so a rented pod never wastes money:
+
+  * ``--smoke`` builds a synthetic cache and trains a tiny model for a few
+    steps. Run it once on a fresh pod to prove NCCL, AMP, checkpointing,
+    W&B and the HF upload all work before starting the real job.
+  * ``--max-hours`` stops cleanly at a wall-clock budget, saving and
+    uploading a resumable checkpoint first.
+  * SIGTERM/SIGINT (pod eviction, Ctrl-C) does the same instead of losing
+    progress; the stop decision is agreed across ranks so no rank hangs.
+  * ``--resume auto`` picks up the newest local checkpoint, pulling it back
+    from the Hugging Face repo first if local storage was wiped.
+  * Each upload replaces the previous checkpoint in the repo, so remote
+    storage stays flat instead of growing by ~2.6 GB per save.
 """
 
 import argparse
 from contextlib import ExitStack
 from datetime import timedelta
 from importlib import import_module
+import json
 import math
 import os
 from pathlib import Path
 import shutil
+import signal
+import sys
 import time
 
 import torch
@@ -58,25 +74,103 @@ def unwrap(module):
     return module.module if isinstance(module, DDP) else module
 
 
-def upload_ckpt_folder(
-    local_dir: str | Path,
-    repo_id: str,
-    token: str,
-    path_in_repo: str | None = None,
-    commit_message: str = "upload checkpoint",
-):
-    """Upload a checkpoint folder to a Hugging Face model repository."""
+# --------------------------------------------------------------------------- #
+#  Graceful shutdown                                                           #
+# --------------------------------------------------------------------------- #
+_STOP = {"requested": False, "reason": ""}
+
+
+def install_signal_handlers():
+    """Turn eviction signals into a clean checkpoint-and-exit request."""
+
+    def handler(signum, _frame):
+        if not _STOP["requested"]:
+            _STOP["requested"] = True
+            _STOP["reason"] = f"signal {signal.Signals(signum).name}"
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, handler)
+        except (ValueError, OSError):
+            # Not all signals are settable on every platform/thread.
+            pass
+
+
+# --------------------------------------------------------------------------- #
+#  Device / RNG helpers (CUDA in production, CPU+gloo for the smoke test)      #
+# --------------------------------------------------------------------------- #
+def preflight_gpu(device: torch.device, is_master: bool):
+    """Fail fast if this PyTorch build has no kernels for the installed GPU.
+
+    An RTX 5090 reports sm_120; a torch built only up to sm_90 will load,
+    allocate, and then die on the first matmul. Catching it here costs a
+    second instead of a pod-hour.
+    """
+    if device.type != "cuda":
+        return
+    major, minor = torch.cuda.get_device_capability(device)
+    arch = f"sm_{major}{minor}"
+    supported = torch.cuda.get_arch_list()
+    if supported and arch not in supported:
+        raise RuntimeError(
+            f"{torch.cuda.get_device_name(device)} needs {arch} kernels but "
+            f"torch {torch.__version__} was built for {supported}. Install a "
+            "matching build (RTX 5090 needs torch>=2.8 with CUDA 12.8+)."
+        )
+    if is_master:
+        print(
+            f"[env] torch {torch.__version__} | cuda {torch.version.cuda} | "
+            f"{torch.cuda.get_device_name(device)} ({arch})",
+            flush=True,
+        )
+
+
+def rng_snapshot(device: torch.device) -> dict:
+    snap = {"cpu": torch.get_rng_state().cpu()}
+    if device.type == "cuda":
+        snap["cuda"] = torch.cuda.get_rng_state(device).cpu()
+    return snap
+
+
+def rng_restore(snap: dict, device: torch.device):
+    torch.set_rng_state(snap["cpu"].cpu())
+    cuda_state = snap.get("cuda")
+    if device.type == "cuda" and cuda_state is not None:
+        torch.cuda.set_rng_state(cuda_state.cpu(), device)
+
+
+# --------------------------------------------------------------------------- #
+#  Hugging Face checkpoint mirror                                              #
+# --------------------------------------------------------------------------- #
+def _hf_api(token: str | None):
     try:
         hub = import_module("huggingface_hub")
     except ImportError as exc:
         raise RuntimeError(
             "huggingface_hub is required when --hf-repo-id is set"
         ) from exc
+    return hub, hub.HfApi(token=token)
 
+
+def upload_ckpt_folder(
+    local_dir: str | Path,
+    repo_id: str,
+    token: str,
+    path_in_repo: str | None = None,
+    commit_message: str = "upload checkpoint",
+    replace_previous: bool = True,
+):
+    """Upload a checkpoint folder to a Hugging Face model repository.
+
+    With ``replace_previous`` the commit also deletes any other ``ckpt_*.pt``
+    already in ``path_in_repo``, so the repo holds exactly the newest
+    checkpoint. Deletion and upload share one commit, so there is never a
+    moment where the repo has no checkpoint at all.
+    """
     local_dir = Path(local_dir)
     if not local_dir.exists():
         raise FileNotFoundError(local_dir)
-    api = hub.HfApi(token=token)
+    hub, api = _hf_api(token)
     hub.create_repo(
         repo_id=repo_id,
         repo_type="model",
@@ -90,12 +184,108 @@ def upload_ckpt_folder(
         path_in_repo=path_in_repo,
         commit_message=commit_message,
         ignore_patterns=["*.tmp", "*.lock"],
+        delete_patterns=["ckpt_*.pt"] if replace_previous else None,
     )
     print(
         f"[hf] uploaded {local_dir} -> {repo_id}"
         + (f"/{path_in_repo}" if path_in_repo else ""),
         flush=True,
     )
+
+
+def latest_local_ckpt(out_dir: Path) -> Path | None:
+    """Newest ``ckpt_NNNNNNN.pt``; the zero-padded names sort numerically."""
+    ckpts = sorted(Path(out_dir).glob("ckpt_*.pt"))
+    return ckpts[-1] if ckpts else None
+
+
+def download_latest_ckpt(
+    repo_id: str,
+    token: str,
+    path_in_repo: str,
+    out_dir: Path,
+) -> Path | None:
+    """Pull the newest checkpoint back from HF into ``out_dir``.
+
+    Used by ``--resume auto`` when a replacement pod starts with empty local
+    storage.
+    """
+    hub, api = _hf_api(token)
+    prefix = f"{path_in_repo}/" if path_in_repo else ""
+    remote = [
+        name
+        for name in api.list_repo_files(repo_id=repo_id, repo_type="model")
+        if name.startswith(f"{prefix}ckpt_") and name.endswith(".pt")
+    ]
+    if not remote:
+        return None
+    newest = sorted(remote)[-1]
+    cached = hub.hf_hub_download(
+        repo_id=repo_id,
+        repo_type="model",
+        filename=newest,
+        token=token,
+    )
+    destination = Path(out_dir) / Path(newest).name
+    shutil.copy2(cached, destination)
+    print(f"[hf] restored {newest} -> {destination}", flush=True)
+    return destination
+
+
+# --------------------------------------------------------------------------- #
+#  Synthetic cache for --smoke                                                 #
+# --------------------------------------------------------------------------- #
+def make_synthetic_cache(root: Path, cfg, n_train: int = 64, n_val: int = 8):
+    """Write a tiny precompute-shaped cache so --smoke needs no real data."""
+    root = Path(root)
+    n_tokens = (cfg.latent.time // cfg.dit.patch_size) * (
+        cfg.latent.freq // cfg.dit.patch_size
+    )
+    for split, count, n_shards in (("train", n_train, 2), ("validation", n_val, 1)):
+        split_dir = root / split
+        split_dir.mkdir(parents=True, exist_ok=True)
+        per_shard = math.ceil(count / n_shards)
+        sizes, names = [], []
+        written = 0
+        for shard_idx in range(n_shards):
+            size = min(per_shard, count - written)
+            if size <= 0:
+                break
+            name = f"shard_{shard_idx:05d}.pt"
+            torch.save(
+                {
+                    "latent": torch.randn(
+                        size, cfg.latent.channels, cfg.latent.time,
+                        cfg.latent.freq, dtype=torch.float16),
+                    "text_emb": torch.randn(
+                        size, cfg.pretrained.text_max_len,
+                        cfg.pretrained.text_dim, dtype=torch.float16),
+                    "text_mask": torch.ones(
+                        size, cfg.pretrained.text_max_len, dtype=torch.long),
+                    "repa": torch.randn(
+                        size, n_tokens, cfg.pretrained.repa_dim,
+                        dtype=torch.float16),
+                    "caption": [f"synthetic {split} {i}" for i in range(size)],
+                },
+                split_dir / name,
+            )
+            names.append(name)
+            sizes.append(size)
+            written += size
+        meta = {
+            "split": split,
+            "num_samples": written,
+            "shards": names,
+            "shard_size": per_shard,
+            "shard_sizes": sizes,
+            "latent_scale": 1.0,
+            "latent_mean": 0.0,
+            "latent_std": 1.0,
+            "synthetic": True,
+        }
+        with open(split_dir / "meta.json", "w") as handle:
+            json.dump(meta, handle, indent=2)
+    return root
 
 
 def init_wandb(
@@ -200,13 +390,11 @@ def validate(
     seed: int,
     amp_enabled: bool,
 ) -> dict[str, float]:
-    """Run deterministic, sample-weighted validation across all GPU ranks."""
+    """Run deterministic, sample-weighted validation across all ranks."""
     raw_model = unwrap(model)
     raw_projector = unwrap(projector)
-    cpu_rng_state = torch.get_rng_state()
-    cuda_rng_state = torch.cuda.get_rng_state(device)
+    train_rng = rng_snapshot(device)
     torch.manual_seed(seed + rank)
-    torch.cuda.manual_seed(seed + rank)
 
     raw_model.eval()
     raw_projector.eval()
@@ -226,7 +414,9 @@ def validate(
             v_target = diffusion.v_target(z0, t, eps)
 
             with torch.autocast(
-                device_type="cuda", dtype=torch.float16, enabled=amp_enabled
+                device_type=device.type,
+                dtype=torch.float16,
+                enabled=amp_enabled,
             ):
                 v_pred, hidden = raw_model(
                     z_t,
@@ -268,8 +458,7 @@ def validate(
             "num_samples": count,
         }
     finally:
-        torch.set_rng_state(cpu_rng_state)
-        torch.cuda.set_rng_state(cuda_rng_state, device)
+        rng_restore(train_rng, device)
         raw_model.train()
         raw_projector.train()
 
@@ -310,15 +499,36 @@ def validate_resume_config(saved: dict | None, current: dict):
         )
 
 
-def gather_rng_states(device) -> list[dict]:
-    """Collect CPU and CUDA RNG state from every rank for exact resume."""
-    local_state = {
-        "cpu": torch.get_rng_state().cpu(),
-        "cuda": torch.cuda.get_rng_state(device).cpu(),
-    }
-    states: list[dict | None] = [None] * dist.get_world_size()
-    dist.all_gather_object(states, local_state)
-    return states
+def _all_gather_bytes(
+    state: torch.Tensor, device: torch.device
+) -> list[torch.Tensor]:
+    """All-gather a fixed-size byte tensor across ranks."""
+    local = state.to(device=device, dtype=torch.uint8)
+    gathered = [torch.empty_like(local) for _ in range(dist.get_world_size())]
+    dist.all_gather(gathered, local)
+    return [tensor.to("cpu", copy=True) for tensor in gathered]
+
+
+def gather_rng_states(device: torch.device) -> list[dict]:
+    """Collect CPU and CUDA RNG state from every rank for exact resume.
+
+    RNG states are equal-sized byte tensors, so a plain all_gather works and
+    avoids the pickle-based object collective (which needs NumPy and cannot
+    send CPU tensors over NCCL).
+    """
+    cpu_states = _all_gather_bytes(torch.get_rng_state(), device)
+    cuda_states = (
+        _all_gather_bytes(torch.cuda.get_rng_state(device), device)
+        if device.type == "cuda"
+        else None
+    )
+    return [
+        {
+            "cpu": cpu_states[i],
+            "cuda": cuda_states[i] if cuda_states is not None else None,
+        }
+        for i in range(dist.get_world_size())
+    ]
 
 
 def save_ckpt(
@@ -332,15 +542,17 @@ def save_ckpt(
     step: int,
     cfg,
     *,
+    device: torch.device,
     epoch: int,
     batch_in_epoch: int,
     runtime_state: dict,
     best_val: dict,
     hf_repo_id: str | None = None,
     hf_token: str | None = None,
-    upload_every: int = 5,
+    upload_every: int = 1,
     keep_local: int = 1,
     path_in_repo: str = "checkpoints",
+    replace_remote: bool = True,
     force_upload: bool = False,
 ):
     """Atomically save complete DDP resume state from global rank zero."""
@@ -353,7 +565,7 @@ def save_ckpt(
     if is_master:
         out_dir.mkdir(parents=True, exist_ok=True)
     dist.barrier()
-    rng_states = gather_rng_states(torch.cuda.current_device())
+    rng_states = gather_rng_states(device)
 
     if is_master:
         payload = {
@@ -407,6 +619,7 @@ def save_ckpt(
                     token=hf_token,
                     path_in_repo=path_in_repo,
                     commit_message=f"ckpt step {step}",
+                    replace_previous=replace_remote,
                 )
                 upload_succeeded = True
             except Exception as exc:
@@ -435,48 +648,93 @@ def save_ckpt(
     return ckpt_path
 
 
-def train(args: argparse.Namespace):
-    local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local_rank)
+def train(args: argparse.Namespace) -> int:
+    run_started = time.time()
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    use_cuda = torch.cuda.is_available()
+    if use_cuda:
+        torch.cuda.set_device(local_rank)
+        device = torch.device("cuda", local_rank)
+        backend = "nccl"
+    else:
+        device = torch.device("cpu")
+        backend = "gloo"
+
+    out_dir = Path(args.out)
+    cfg = Config.smoke() if args.smoke else Config()
+    for field, override in (
+        ("total_steps", args.total_steps),
+        ("ckpt_every", args.ckpt_every),
+        ("log_every", args.log_every),
+        ("warmup_steps", args.warmup_steps),
+        ("repa_decay_steps", args.repa_decay_steps),
+    ):
+        if override is not None:
+            setattr(cfg.train, field, override)
+
+    # --smoke fabricates its own cache so a fresh pod can self-test with no data.
+    data_root = args.data
+    if args.smoke and data_root is None:
+        data_root = str(out_dir / "_smoke_cache")
+        if local_rank == 0 and not (
+            Path(data_root) / "train" / "meta.json"
+        ).exists():
+            make_synthetic_cache(Path(data_root), cfg)
+
+    # Rank 1 blocks in the rendezvous until rank 0 finishes any cache setup.
     dist.init_process_group(
-        backend="nccl",
+        backend=backend,
         init_method="env://",
         timeout=timedelta(hours=2),
     )
-
     rank = dist.get_rank()
     world = dist.get_world_size()
     is_master = rank == 0
-    device = torch.device("cuda", local_rank)
 
-    if world != 2:
-        raise RuntimeError(
-            f"this trainer expects exactly 2 processes/GPUs, but got {world}; "
-            "launch with torchrun --standalone --nproc_per_node=2"
-        )
+    preflight_gpu(device, is_master)
+    if use_cuda:
+        # Shapes are fixed all run, so autotuned kernels pay off immediately.
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
 
-    cfg = Config()
+    amp_enabled = bool(args.amp and use_cuda)
     effective_global_batch = args.batch_size * args.grad_accum_steps * world
     runtime_state = {
         "batch_size": args.batch_size,
         "grad_accum_steps": args.grad_accum_steps,
         "world_size": world,
         "effective_global_batch": effective_global_batch,
-        "amp": args.amp,
+        "amp": amp_enabled,
     }
     if is_master:
-        gpu_name = torch.cuda.get_device_name(device)
+        accel = (
+            torch.cuda.get_device_name(device) if use_cuda else "CPU (gloo)"
+        )
         print(
-            f"[ddp] world_size={world}  GPU={gpu_name}  "
-            f"microbatch/GPU={args.batch_size}  "
+            f"[ddp] world_size={world}  device={accel}  "
+            f"microbatch/rank={args.batch_size}  "
             f"grad_accum={args.grad_accum_steps}  "
             f"effective global batch={effective_global_batch}  "
-            f"precision={'fp16' if args.amp else 'fp32'}",
+            f"precision={'fp16' if amp_enabled else 'fp32'}",
             flush=True,
         )
+        print(
+            f"[ddp] total_steps={cfg.train.total_steps}  "
+            f"ckpt_every={cfg.train.ckpt_every}  "
+            f"log_every={cfg.train.log_every}  "
+            f"max_hours={args.max_hours or 'unlimited'}",
+            flush=True,
+        )
+        if cfg.train.repa_decay_steps > cfg.train.total_steps:
+            print(
+                "[ddp] warning: repa_decay_steps exceeds total_steps, so REPA "
+                "never fully decays; consider --repa-decay-steps",
+                flush=True,
+            )
 
     # The train and validation folders are independent precomputed splits.
-    ds = PrecomputedAudioCaps(args.data, "train")
+    ds = PrecomputedAudioCaps(data_root, "train")
     sampler = ShardDistributedSampler(
         ds,
         num_replicas=world,
@@ -495,18 +753,18 @@ def train(args: argparse.Namespace):
         batch_size=args.batch_size,
         sampler=sampler,
         num_workers=args.workers,
-        pin_memory=True,
+        pin_memory=use_cuda,
         drop_last=True,
         collate_fn=collate_tensors_only,
         persistent_workers=args.workers > 0,
     )
 
     val_ds = PrecomputedAudioCaps(
-        args.data, args.val_split, latent_scale=ds.latent_scale
+        data_root, args.val_split, latent_scale=ds.latent_scale
     )
     if len(val_ds) == 0:
         raise ValueError(
-            f"validation split '{args.val_split}' is empty under {args.data}"
+            f"validation split '{args.val_split}' is empty under {data_root}"
         )
     val_sampler = DistributedEvalSampler(
         val_ds, num_replicas=world, rank=rank
@@ -516,7 +774,7 @@ def train(args: argparse.Namespace):
         batch_size=args.val_batch_size,
         sampler=val_sampler,
         num_workers=args.workers,
-        pin_memory=True,
+        pin_memory=use_cuda,
         drop_last=False,
         collate_fn=collate_tensors_only,
         persistent_workers=args.workers > 0,
@@ -538,7 +796,6 @@ def train(args: argparse.Namespace):
 
     # Identical seed before construction gives every rank identical weights.
     torch.manual_seed(cfg.train.seed)
-    torch.cuda.manual_seed(cfg.train.seed)
     raw_model = build_model(cfg).to(device)
     raw_projector = RepaProjector(
         cfg.dit.hidden_size, cfg.pretrained.repa_dim
@@ -565,15 +822,49 @@ def train(args: argparse.Namespace):
         opt, lr_lambda_factory(cfg.train.warmup_steps, cfg.train.total_steps)
     )
     ema = EMA(raw_model, cfg.train.ema_decay)
-    scaler = torch.cuda.amp.GradScaler(enabled=args.amp)
+    scaler = torch.amp.GradScaler(device=device.type, enabled=amp_enabled)
+
+    if is_master:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    dist.barrier()
+
+    # --resume auto: newest local checkpoint, pulled back from HF if the pod
+    # was recycled and local storage is empty.
+    resume_path = None
+    if args.resume == "auto":
+        if (
+            is_master
+            and args.hf_repo_id
+            and args.hf_token
+            and latest_local_ckpt(out_dir) is None
+        ):
+            try:
+                download_latest_ckpt(
+                    args.hf_repo_id, args.hf_token, args.path_in_repo, out_dir
+                )
+            except Exception as exc:
+                print(f"[hf] could not restore checkpoint: {exc}", flush=True)
+        dist.barrier()
+        resume_path = latest_local_ckpt(out_dir)
+        if is_master:
+            print(
+                f"[ddp] --resume auto -> "
+                f"{resume_path.name if resume_path else 'fresh start'}",
+                flush=True,
+            )
+    elif args.resume:
+        resume_path = Path(args.resume)
 
     start_step = 0
     epoch = 0
     batch_in_epoch = 0
     best_val = {"ema_loss_diff": math.inf, "step": None}
     resume_ckpt = None
-    if args.resume:
-        resume_ckpt = torch.load(args.resume, map_location="cpu")
+    if resume_path is not None:
+        # These checkpoints are self-produced and hold non-tensor resume state.
+        resume_ckpt = torch.load(
+            resume_path, map_location="cpu", weights_only=False
+        )
         validate_resume_config(resume_ckpt.get("config"), cfg.as_dict())
         saved_runtime = resume_ckpt.get("runtime")
         if saved_runtime is not None:
@@ -626,38 +917,26 @@ def train(args: argparse.Namespace):
             batch_in_epoch = int(data_state["batch_in_epoch"])
         best_val = resume_ckpt.get("best_val", best_val)
         if is_master:
-            print(f"[ddp] resumed from {args.resume} at step {start_step}")
+            print(f"[ddp] resumed from {resume_path} at step {start_step}")
 
     # DDP wraps only after checkpoint loading to keep state-dict keys portable.
-    model = DDP(
-        raw_model,
-        device_ids=[local_rank],
-        output_device=local_rank,
-        broadcast_buffers=False,
-        gradient_as_bucket_view=True,
-    )
-    projector = DDP(
-        raw_projector,
-        device_ids=[local_rank],
-        output_device=local_rank,
-        broadcast_buffers=False,
-        gradient_as_bucket_view=True,
-    )
+    ddp_kwargs = {
+        "broadcast_buffers": False,
+        "gradient_as_bucket_view": True,
+    }
+    if use_cuda:
+        ddp_kwargs["device_ids"] = [local_rank]
+        ddp_kwargs["output_device"] = local_rank
+    model = DDP(raw_model, **ddp_kwargs)
+    projector = DDP(raw_projector, **ddp_kwargs)
 
     # Training randomness differs per rank; checkpointed states restore it.
     torch.manual_seed(cfg.train.seed * 1000 + rank)
-    torch.cuda.manual_seed(cfg.train.seed * 1000 + rank)
     saved_rng_states = (
         resume_ckpt.get("rng_states") if resume_ckpt is not None else None
     )
     if saved_rng_states is not None and rank < len(saved_rng_states):
-        torch.set_rng_state(saved_rng_states[rank]["cpu"])
-        torch.cuda.set_rng_state(saved_rng_states[rank]["cuda"], device)
-
-    out_dir = Path(args.out)
-    if is_master:
-        out_dir.mkdir(parents=True, exist_ok=True)
-    dist.barrier()
+        rng_restore(saved_rng_states[rank], device)
 
     wandb_resume_id = (
         resume_ckpt.get("wandb_run_id") if resume_ckpt is not None else None
@@ -693,6 +972,11 @@ def train(args: argparse.Namespace):
     opt.zero_grad(set_to_none=True)
     t0 = time.time()
 
+    max_seconds = args.max_hours * 3600.0 if args.max_hours > 0 else None
+    stop_signal = torch.zeros(1, dtype=torch.int32, device=device)
+    stopped_early = False
+    stop_reason = ""
+
     while not done:
         sampler.set_epoch(epoch)
         sampler.set_start_index(batch_in_epoch * args.batch_size)
@@ -725,9 +1009,9 @@ def train(args: argparse.Namespace):
                     stack.enter_context(model.no_sync())
                     stack.enter_context(projector.no_sync())
                 with torch.autocast(
-                    device_type="cuda",
+                    device_type=device.type,
                     dtype=torch.float16,
-                    enabled=args.amp,
+                    enabled=amp_enabled,
                 ):
                     v_pred, hidden = model(
                         z_t,
@@ -826,7 +1110,7 @@ def train(args: argparse.Namespace):
                     rank,
                     lam,
                     args.val_seed,
-                    args.amp,
+                    amp_enabled,
                 )
                 log_validation(
                     val_metrics, step, is_master, args.wandb_enabled
@@ -852,6 +1136,7 @@ def train(args: argparse.Namespace):
                     scaler,
                     step,
                     cfg,
+                    device=device,
                     epoch=next_epoch,
                     batch_in_epoch=next_batch,
                     runtime_state=runtime_state,
@@ -861,10 +1146,58 @@ def train(args: argparse.Namespace):
                     upload_every=args.upload_every,
                     keep_local=args.keep_local,
                     path_in_repo=args.path_in_repo,
+                    replace_remote=args.replace_remote,
                 )
                 if is_master:
                     print(f"[ddp] checkpoint at step {step}", flush=True)
                 last_saved_step = step
+
+            # Every rank must reach the same stop verdict or the next
+            # collective would hang, so agree on it before acting.
+            local_stop = _STOP["requested"] or (
+                max_seconds is not None
+                and time.time() - run_started >= max_seconds
+            )
+            stop_signal.fill_(1 if local_stop else 0)
+            dist.all_reduce(stop_signal, op=dist.ReduceOp.MAX)
+            if stop_signal.item():
+                stop_reason = _STOP["reason"] or (
+                    f"reached --max-hours {args.max_hours}"
+                )
+                if is_master:
+                    print(
+                        f"[ddp] stopping early at step {step}: {stop_reason}",
+                        flush=True,
+                    )
+                save_ckpt(
+                    out_dir,
+                    model,
+                    projector,
+                    ema,
+                    opt,
+                    sched,
+                    scaler,
+                    step,
+                    cfg,
+                    device=device,
+                    epoch=next_epoch,
+                    batch_in_epoch=next_batch,
+                    runtime_state=runtime_state,
+                    best_val=best_val,
+                    hf_repo_id=args.hf_repo_id,
+                    hf_token=args.hf_token,
+                    upload_every=args.upload_every,
+                    keep_local=args.keep_local,
+                    path_in_repo=args.path_in_repo,
+                    replace_remote=args.replace_remote,
+                    force_upload=True,
+                )
+                last_saved_step = step
+                step += 1
+                epoch, batch_in_epoch = next_epoch, next_batch
+                done = True
+                stopped_early = True
+                break
 
             step += 1
             micro_in_update = 0
@@ -894,6 +1227,7 @@ def train(args: argparse.Namespace):
             scaler,
             final_step,
             cfg,
+            device=device,
             epoch=epoch,
             batch_in_epoch=batch_in_epoch,
             runtime_state=runtime_state,
@@ -903,15 +1237,29 @@ def train(args: argparse.Namespace):
             upload_every=args.upload_every,
             keep_local=args.keep_local,
             path_in_repo=args.path_in_repo,
+            replace_remote=args.replace_remote,
             force_upload=True,
         )
     if is_master:
         if wandb is not None and wandb.run is not None:
             wandb.finish()
-        print(
-            f"[ddp] done at step {final_step}; checkpoints: {out_dir}",
-            flush=True,
-        )
+        elapsed_h = (time.time() - run_started) / 3600.0
+        if stopped_early:
+            print(
+                f"[ddp] stopped at step {final_step} of "
+                f"{cfg.train.total_steps} after {elapsed_h:.2f} h "
+                f"({stop_reason}). Resume with the same flags plus "
+                f"--resume auto",
+                flush=True,
+            )
+        else:
+            print(
+                f"[ddp] finished all {cfg.train.total_steps} steps in "
+                f"{elapsed_h:.2f} h; checkpoints: {out_dir}",
+                flush=True,
+            )
+        print(f"[ddp] best val ema_loss_diff: {best_val}", flush=True)
+    return 0
 
 
 def parse_args() -> argparse.Namespace:
@@ -919,13 +1267,23 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--data",
         type=str,
-        required=True,
+        default=None,
         help="precompute cache root containing train/ and validation/",
     )
+    ap.add_argument("--out", type=str, default="./runs/dit_b2")
     ap.add_argument(
-        "--out", type=str, default="/kaggle/working/runs/dit_b2"
+        "--resume",
+        type=str,
+        default=None,
+        help="checkpoint path, or 'auto' to continue the newest one "
+        "(restored from the HF repo if local storage is empty)",
     )
-    ap.add_argument("--resume", type=str, default=None)
+    ap.add_argument(
+        "--smoke",
+        action="store_true",
+        help="tiny model on a synthetic cache: proves the harness works "
+        "before committing to a paid run",
+    )
     ap.add_argument(
         "--workers",
         type=int,
@@ -938,7 +1296,7 @@ def parse_args() -> argparse.Namespace:
         dest="batch_size",
         type=int,
         default=2,
-        help="microbatch per T4 GPU",
+        help="microbatch per GPU (2 fits a 16 GB T4; try 8-16 on a 5090)",
     )
     ap.add_argument(
         "--grad-accum-steps",
@@ -946,13 +1304,62 @@ def parse_args() -> argparse.Namespace:
         dest="grad_accum_steps",
         type=int,
         default=64,
-        help="microbatches per update (2 x 64 x 2 = 256 global by default)",
+        help="microbatches per update (2 x 64 x 2 GPUs = 256 global)",
     )
     ap.add_argument(
         "--amp",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="use FP16 autocast and GradScaler (default: enabled)",
+    )
+    ap.add_argument(
+        "--max-hours",
+        "--max_hours",
+        dest="max_hours",
+        type=float,
+        default=0.0,
+        help="stop cleanly after this many wall-clock hours, saving and "
+        "uploading first; 0 disables the budget",
+    )
+    ap.add_argument(
+        "--total-steps",
+        "--total_steps",
+        dest="total_steps",
+        type=int,
+        default=None,
+        help="override Config.train.total_steps",
+    )
+    ap.add_argument(
+        "--ckpt-every",
+        "--ckpt_every",
+        dest="ckpt_every",
+        type=int,
+        default=None,
+        help="override Config.train.ckpt_every",
+    )
+    ap.add_argument(
+        "--log-every",
+        "--log_every",
+        dest="log_every",
+        type=int,
+        default=None,
+        help="override Config.train.log_every",
+    )
+    ap.add_argument(
+        "--warmup-steps",
+        "--warmup_steps",
+        dest="warmup_steps",
+        type=int,
+        default=None,
+        help="override Config.train.warmup_steps",
+    )
+    ap.add_argument(
+        "--repa-decay-steps",
+        "--repa_decay_steps",
+        dest="repa_decay_steps",
+        type=int,
+        default=None,
+        help="override Config.train.repa_decay_steps",
     )
     ap.add_argument(
         "--val-split",
@@ -995,7 +1402,14 @@ def parse_args() -> argparse.Namespace:
         "--upload_every",
         dest="upload_every",
         type=int,
-        default=5,
+        default=1,
+        help="upload every Nth checkpoint; 1 keeps the remote copy current",
+    )
+    ap.add_argument(
+        "--replace-remote",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="delete older ckpt_*.pt in the HF repo when uploading a new one",
     )
     ap.add_argument(
         "--keep-local",
@@ -1043,28 +1457,47 @@ def parse_args() -> argparse.Namespace:
         ap.error("--val-batch-size must be positive")
     if args.workers < 0:
         ap.error("--workers cannot be negative")
+    if args.max_hours < 0:
+        ap.error("--max-hours cannot be negative")
     if "LOCAL_RANK" not in os.environ:
         ap.error(
             "launch this script with torchrun --standalone "
             "--nproc_per_node=2 train_ddp.py ..."
         )
-    if not torch.cuda.is_available():
-        ap.error("CUDA is required for the DDP trainer")
-    for split in ("train", args.val_split):
-        meta_path = Path(args.data) / split / "meta.json"
-        if not meta_path.exists():
-            ap.error(f"missing precomputed split metadata: {meta_path}")
+
+    if args.smoke:
+        # Keep the synthetic epoch large enough for several updates, and make
+        # every periodic path (log/val/ckpt) fire within a handful of steps.
+        args.batch_size = min(args.batch_size, 2)
+        args.grad_accum_steps = min(args.grad_accum_steps, 2)
+        args.val_batch_size = min(args.val_batch_size, 2)
+        args.val_every = min(args.val_every, 5) if args.val_every > 0 else 5
+        args.workers = 0
+        if not args.wandb_api_key:
+            args.wandb_enabled = False
+    elif not torch.cuda.is_available():
+        ap.error("CUDA is required for the DDP trainer (use --smoke on CPU)")
+
+    if args.data is None:
+        if not args.smoke:
+            ap.error("--data is required unless running --smoke")
+    else:
+        for split in ("train", args.val_split):
+            meta_path = Path(args.data) / split / "meta.json"
+            if not meta_path.exists():
+                ap.error(f"missing precomputed split metadata: {meta_path}")
     return args
 
 
-def main():
+def main() -> int:
+    install_signal_handlers()
     args = parse_args()
     try:
-        train(args)
+        return train(args)
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

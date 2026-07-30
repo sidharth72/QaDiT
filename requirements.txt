@@ -1,5 +1,7 @@
-# Core (needed for train.py --smoke: torch only)
-torch>=2.2
+# Core (needed for train.py --smoke: torch only).
+# RTX 5090 / Blackwell (sm_120) needs a CUDA 12.8+ build, which means >=2.8;
+# train_ddp.py verifies the installed build has kernels for the GPU at startup.
+torch>=2.8
 
 # Audio front-end (precompute + inference)
 torchaudio>=2.2
