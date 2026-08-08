@@ -10,7 +10,7 @@ Two ways to run it:
      Builds a tiny DiT, feeds synthetic tensors of the exact real shapes,
      checks that both losses go down, and runs the DDIM sampler end-to-end.
      If this passes, the whole architecture is wired correctly and the same
-     code paths will work on GPU - and later, with minor changes, on XLA.
+     code paths are shared by the multi-GPU trainer in train_ddp.py.
 
 Per training step (mirrors AudioDiffusionModel.md section 11):
 
@@ -159,7 +159,7 @@ def train_step(batch: dict, model: DiT, projector: RepaProjector,
     loss = loss_diff + lam * loss_repa
 
     logs = {"loss": loss.item(), "diff": loss_diff.item(),
-            "repa": float(loss_repa), "lambda": lam}
+            "repa": loss_repa.detach().item(), "lambda": lam}
     return loss, logs
 
 

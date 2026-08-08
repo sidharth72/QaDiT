@@ -55,7 +55,8 @@ def main():
     print(f"[sample] latent scale = {latent_scale:.4f}")
 
     # ---------------- EMA DiT ---------------------------------------------- #
-    ckpt = torch.load(args.ckpt, map_location=device)
+    # Trainer checkpoints carry non-tensor resume state alongside the weights.
+    ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
     model = build_model(cfg).to(device).eval()
     model.load_state_dict(ckpt["ema"])       # ALWAYS sample from the EMA copy
     print(f"[sample] loaded EMA weights from {args.ckpt} (step {ckpt['step']})")

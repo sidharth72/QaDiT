@@ -352,8 +352,8 @@ class DiT(nn.Module):
             ctx = self.text_proj(text_emb)              # [B, L, hidden]
             ctx_mask = text_mask
             # NOTE: no `.any()` short-circuit here - reading a device tensor
-            # from Python forces a host<->device sync every step, which stalls
-            # XLA/TPU pipelines.  torch.where with an all-False mask is free.
+            # from Python forces a host/device sync every step. torch.where
+            # also keeps this path identical across distributed ranks.
             if drop_mask is not None:
                 # Per-sample CFG dropout: pad the null token out to length L so
                 # conditional/unconditional samples share one tensor shape.

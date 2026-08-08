@@ -1,5 +1,7 @@
-# Core (needed for train.py --smoke: torch only)
-torch>=2.2
+# Core (needed for train.py --smoke: torch only).
+# RTX 5090 / Blackwell (sm_120) needs a CUDA 12.8+ build, which means >=2.8;
+# train_ddp.py verifies the installed build has kernels for the GPU at startup.
+torch>=2.8
 
 # Audio front-end (precompute + inference)
 torchaudio>=2.2
@@ -17,7 +19,6 @@ accelerate>=0.30        # speeds up HF model loading
 datasets>=3.0,<4.0
 numpy>=1.24
 
-# TPU training telemetry/checkpoint backup (torch + torch_xla must be installed
-# as a matched pair by the Kaggle TPU image; see README.md).
+# DDP training telemetry and checkpoint backup.
 huggingface_hub
 wandb
